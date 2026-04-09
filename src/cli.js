@@ -10,6 +10,7 @@ const HOME = os.homedir();
 const CODEX_DIR = process.env.CODEX_SWITCHER_CODEX_DIR || path.join(HOME, ".codex");
 const AUTH_PATH = process.env.CODEX_SWITCHER_AUTH_PATH || path.join(CODEX_DIR, "auth.json");
 const STORE_DIR = process.env.CODEX_SWITCHER_STORE_DIR || path.join(HOME, ".codex-keyring");
+const CODEX_BIN = process.env.CODEX_SWITCHER_CODEX_BIN || "codex";
 const ACCOUNTS_DIR = path.join(STORE_DIR, "accounts");
 const STATE_PATH = path.join(STORE_DIR, "state.json");
 
@@ -83,6 +84,27 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function decodeJwtPayload(token) {
+  if (!token || typeof token !== "string") {
+    return null;
+  }
+  const parts = token.split(".");
+  if (parts.length < 2) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function extractEmailFromAuth(authObject) {
+  const payload = decodeJwtPayload(authObject?.tokens?.id_token);
+  return payload?.email || null;
+}
+
 function safeAccountId(authObject) {
   const accountId = authObject?.tokens?.account_id || authObject?.account_id || "";
   if (!accountId) {
@@ -151,6 +173,7 @@ function addCurrentAccount(alias, sourcePath = AUTH_PATH) {
   state.accounts[alias] = {
     alias,
     authMode: authObject.auth_mode || "unknown",
+    email: extractEmailFromAuth(authObject),
     accountId: authObject?.tokens?.account_id || null,
     accountIdShort: safeAccountId(authObject),
     authHash: authHash(authObject),
@@ -170,6 +193,34 @@ function addCurrentAccount(alias, sourcePath = AUTH_PATH) {
   console.log(`Added account '${alias}' (${state.accounts[alias].accountIdShort})`);
 }
 
+async function addAccountWithLogin(alias, options = {}) {
+  const sourcePath = options.from || AUTH_PATH;
+  if (options.from) {
+    fatal("--login cannot be combined with --from");
+  }
+
+  ensureAlias(alias);
+  const state = readState();
+  if (state.accounts[alias]) {
+    fatal(`Alias already exists: ${alias}`);
+  }
+
+  await runInteractiveCommand(CODEX_BIN, ["logout"], {
+    allowFailure: true,
+    stepLabel: "Logging out of current Codex account",
+  });
+
+  const loginArgs = ["login"];
+  if (options["device-auth"]) {
+    loginArgs.push("--device-auth");
+  }
+  await runInteractiveCommand(CODEX_BIN, loginArgs, {
+    stepLabel: "Starting Codex login flow",
+  });
+
+  addCurrentAccount(alias, sourcePath);
+}
+
 function listAccounts() {
   const state = readState();
   const activeAlias = syncActiveAlias(state);
@@ -179,16 +230,72 @@ function listAccounts() {
     return;
   }
 
-  for (const alias of aliases) {
+  let stateChanged = false;
+  const rows = aliases.map((alias) => {
     const account = state.accounts[alias];
-    const marker = alias === activeAlias ? "*" : " ";
-    const remaining =
-      typeof account.remainingTokens === "number" ? String(account.remainingTokens) : "unknown";
-    const resetAt = account.resetAt || "unknown";
-    console.log(
-      `${marker} ${alias}  status=${account.status}  remaining=${remaining}  reset=${resetAt}  account=${account.accountIdShort}`
-    );
+    if (!account.email && account.snapshotPath && fs.existsSync(account.snapshotPath)) {
+      const snapshotAuth = readJson(account.snapshotPath);
+      const snapshotEmail = extractEmailFromAuth(snapshotAuth);
+      if (snapshotEmail) {
+        account.email = snapshotEmail;
+        stateChanged = true;
+      }
+    }
+    return {
+      Active: alias === activeAlias ? "*" : "",
+      Alias: alias,
+      Email: account.email || "unknown",
+      Status: account.status || "unknown",
+      Remaining:
+        typeof account.remainingTokens === "number" ? String(account.remainingTokens) : "unknown",
+      Reset: account.resetAt || "unknown",
+      Account: account.accountIdShort || "unknown",
+      "Last Used": account.lastUsedAt || "never",
+      Note: account.note || "",
+    };
+  });
+
+  printTable(rows, [
+    "Active",
+    "Alias",
+    "Email",
+    "Status",
+    "Remaining",
+    "Reset",
+    "Account",
+    "Last Used",
+    "Note",
+  ]);
+
+  if (stateChanged) {
+    saveState(state);
   }
+}
+
+function printTable(rows, columns) {
+  const widths = {};
+  for (const column of columns) {
+    widths[column] = column.length;
+  }
+
+  for (const row of rows) {
+    for (const column of columns) {
+      const value = String(row[column] ?? "");
+      widths[column] = Math.max(widths[column], value.length);
+    }
+  }
+
+  const separator = `+-${columns.map((column) => "-".repeat(widths[column])).join("-+-")}-+`;
+  const renderRow = (row) =>
+    `| ${columns.map((column) => String(row[column] ?? "").padEnd(widths[column], " ")).join(" | ")} |`;
+
+  console.log(separator);
+  console.log(renderRow(Object.fromEntries(columns.map((column) => [column, column]))));
+  console.log(separator);
+  for (const row of rows) {
+    console.log(renderRow(row));
+  }
+  console.log(separator);
 }
 
 function showStatus() {
@@ -315,9 +422,11 @@ function parseOptions(argv) {
       continue;
     }
     const [key, inlineValue] = token.slice(2).split("=", 2);
-    const value = inlineValue !== undefined ? inlineValue : argv[index + 1];
+    const nextToken = argv[index + 1];
+    const hasSeparateValue = inlineValue === undefined && nextToken !== undefined && !nextToken.startsWith("--");
+    const value = inlineValue !== undefined ? inlineValue : hasSeparateValue ? nextToken : true;
     options[key] = value;
-    if (inlineValue === undefined) {
+    if (hasSeparateValue) {
       index += 1;
     }
   }
@@ -348,6 +457,7 @@ Notes:
 
 function doctor() {
   ensureStore();
+  console.log(`codex_bin=${CODEX_BIN}`);
   console.log(`codex_dir=${CODEX_DIR}`);
   console.log(`auth_path=${AUTH_PATH}`);
   console.log(`auth_exists=${currentAuthExists()}`);
@@ -444,6 +554,29 @@ function spawnAndMirror(commandArgs) {
   });
 }
 
+function runInteractiveCommand(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    if (options.stepLabel) {
+      console.error(options.stepLabel);
+    }
+
+    const child = spawn(command, args, {
+      cwd: process.cwd(),
+      env: process.env,
+      stdio: "inherit",
+    });
+
+    child.on("error", reject);
+    child.on("close", (exitCode) => {
+      if (exitCode === 0 || options.allowFailure) {
+        resolve(exitCode);
+        return;
+      }
+      reject(new Error(`${command} ${args.join(" ")} exited with code ${exitCode}`));
+    });
+  });
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   const command = argv[0];
@@ -455,7 +588,14 @@ async function main() {
 
   switch (command) {
     case "add":
-      addCurrentAccount(argv[1], parseOptions(argv.slice(2)).from || AUTH_PATH);
+      {
+        const options = parseOptions(argv.slice(2));
+        if (options.login !== undefined) {
+          await addAccountWithLogin(argv[1], options);
+          return;
+        }
+        addCurrentAccount(argv[1], options.from || AUTH_PATH);
+      }
       return;
     case "list":
       listAccounts();

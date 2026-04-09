@@ -17,6 +17,8 @@ Sau do dung lenh `ckr`.
 ckr add work
 ckr add personal
 ckr add backup --from /path/to/auth.json
+ckr add secondary --login
+ckr add secondary --login --device-auth
 ckr list
 ckr status
 ckr use personal
@@ -30,6 +32,8 @@ ckr run -- codex exec "hello"
 
 - `ckr add <alias>`: luu snapshot account hien tai tu `~/.codex/auth.json`.
 - `ckr add <alias> --from /path/to/auth.json`: import snapshot tu mot file auth khac.
+- `ckr add <alias> --login`: logout account hien tai, mo flow `codex login`, sau do luu account moi vao keyring.
+- `ckr add <alias> --login --device-auth`: tuong tu tren, nhung buoc login dung `codex login --device-auth`.
 - `ckr use <alias>`: copy snapshot da luu ve lai `~/.codex/auth.json`.
 - `ckr next`: chuyen sang account tiep theo khong bi danh dau `exhausted`.
 - `ckr run -- <command...>`: chay command va neu gap loi giong quota/rate-limit thi danh dau account hien tai la `exhausted`, sau do switch sang account tiep theo va chay lai.
@@ -54,6 +58,7 @@ Co the override duong dan mac dinh bang env:
 
 ```bash
 CODEX_SWITCHER_AUTH_PATH=/tmp/auth.json \
+CODEX_SWITCHER_CODEX_BIN=/path/to/mock-codex \
 CODEX_SWITCHER_STORE_DIR=/tmp/codex-keyring \
 ckr doctor
 ```
