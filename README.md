@@ -11,6 +11,12 @@ npm link
 
 Sau do dung lenh `ckr`.
 
+## Ho tro he dieu hanh
+
+- `macOS`: da verify va test truc tiep.
+- `Linux`: du kien chay duoc vi day la Node.js CLI, nhung chua verify end-to-end.
+- `Windows`: chua test, chua xem la ho tro chinh thuc.
+
 ## Lenh co san
 
 ```bash
