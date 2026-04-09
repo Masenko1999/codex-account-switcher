@@ -1,0 +1,14 @@
+{
+  "name": "codex-account-switcher",
+  "version": "0.1.0",
+  "description": "Local multi-account switcher for Codex auth.json with best-effort failover.",
+  "type": "commonjs",
+  "bin": {
+    "ckr": "./bin/ckr.js"
+  },
+  "scripts": {
+    "start": "node ./bin/ckr.js",
+    "check": "node ./bin/ckr.js doctor"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,518 @@
+"use strict";
+
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { spawn } = require("node:child_process");
+
+const HOME = os.homedir();
+const CODEX_DIR = process.env.CODEX_SWITCHER_CODEX_DIR || path.join(HOME, ".codex");
+const AUTH_PATH = process.env.CODEX_SWITCHER_AUTH_PATH || path.join(CODEX_DIR, "auth.json");
+const STORE_DIR = process.env.CODEX_SWITCHER_STORE_DIR || path.join(HOME, ".codex-keyring");
+const ACCOUNTS_DIR = path.join(STORE_DIR, "accounts");
+const STATE_PATH = path.join(STORE_DIR, "state.json");
+
+const QUOTA_PATTERNS = [
+  /quota/i,
+  /usage limit/i,
+  /rate limit/i,
+  /too many requests/i,
+  /limit reached/i,
+  /token limit/i,
+  /exceeded your current usage/i,
+  /insufficient_quota/i,
+];
+
+function fatal(message, code = 1) {
+  console.error(`Error: ${message}`);
+  process.exit(code);
+}
+
+function ensureStore() {
+  fs.mkdirSync(ACCOUNTS_DIR, { recursive: true, mode: 0o700 });
+  if (!fs.existsSync(STATE_PATH)) {
+    const initial = {
+      version: 1,
+      activeAlias: null,
+      accountOrder: [],
+      accounts: {},
+    };
+    writeJson(STATE_PATH, initial, 0o600);
+  }
+}
+
+function readJson(filePath) {
+  return JSON.parse(fs.readFileSync(filePath, "utf8"));
+}
+
+function writeJson(filePath, value, mode = 0o600) {
+  fs.writeFileSync(filePath, JSON.stringify(value, null, 2) + "\n", {
+    mode,
+  });
+}
+
+function readState() {
+  ensureStore();
+  return readJson(STATE_PATH);
+}
+
+function saveState(state) {
+  writeJson(STATE_PATH, state, 0o600);
+}
+
+function currentAuthExists() {
+  return fs.existsSync(AUTH_PATH);
+}
+
+function readCurrentAuth() {
+  if (!currentAuthExists()) {
+    fatal(`Missing Codex auth file at ${AUTH_PATH}`);
+  }
+  return readJson(AUTH_PATH);
+}
+
+function authHash(authObject) {
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify(authObject))
+    .digest("hex");
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function safeAccountId(authObject) {
+  const accountId = authObject?.tokens?.account_id || authObject?.account_id || "";
+  if (!accountId) {
+    return "unknown";
+  }
+  return `${accountId.slice(0, 8)}...`;
+}
+
+function accountSnapshotPath(alias) {
+  return path.join(ACCOUNTS_DIR, `${alias}.auth.json`);
+}
+
+function ensureAlias(alias) {
+  if (!alias || !/^[a-zA-Z0-9._-]+$/.test(alias)) {
+    fatal("Alias must match [a-zA-Z0-9._-]+");
+  }
+}
+
+function getAccount(state, alias) {
+  const account = state.accounts[alias];
+  if (!account) {
+    fatal(`Unknown account alias: ${alias}`);
+  }
+  return account;
+}
+
+function detectActiveAlias(state) {
+  if (!currentAuthExists()) {
+    return null;
+  }
+  const currentHash = authHash(readCurrentAuth());
+  for (const alias of Object.keys(state.accounts)) {
+    const account = state.accounts[alias];
+    if (account.authHash === currentHash) {
+      return alias;
+    }
+  }
+  return null;
+}
+
+function syncActiveAlias(state) {
+  state.activeAlias = detectActiveAlias(state);
+  saveState(state);
+  return state.activeAlias;
+}
+
+function copyFileStrict(source, destination) {
+  fs.copyFileSync(source, destination);
+  fs.chmodSync(destination, 0o600);
+}
+
+function addCurrentAccount(alias, sourcePath = AUTH_PATH) {
+  ensureAlias(alias);
+  ensureStore();
+  const state = readState();
+  if (state.accounts[alias]) {
+    fatal(`Alias already exists: ${alias}`);
+  }
+  if (!fs.existsSync(sourcePath)) {
+    fatal(`Missing auth source file: ${sourcePath}`);
+  }
+  const authObject = readJson(sourcePath);
+  const snapshotPath = accountSnapshotPath(alias);
+  copyFileStrict(sourcePath, snapshotPath);
+
+  state.accounts[alias] = {
+    alias,
+    authMode: authObject.auth_mode || "unknown",
+    accountId: authObject?.tokens?.account_id || null,
+    accountIdShort: safeAccountId(authObject),
+    authHash: authHash(authObject),
+    snapshotPath,
+    status: "unknown",
+    remainingTokens: null,
+    resetAt: null,
+    note: null,
+    createdAt: nowIso(),
+    lastSeenAt: nowIso(),
+    lastUsedAt: null,
+    lastExhaustedAt: null,
+  };
+  state.accountOrder.push(alias);
+  state.activeAlias = detectActiveAlias(state);
+  saveState(state);
+  console.log(`Added account '${alias}' (${state.accounts[alias].accountIdShort})`);
+}
+
+function listAccounts() {
+  const state = readState();
+  const activeAlias = syncActiveAlias(state);
+  const aliases = state.accountOrder.filter((alias) => state.accounts[alias]);
+  if (aliases.length === 0) {
+    console.log("No accounts saved.");
+    return;
+  }
+
+  for (const alias of aliases) {
+    const account = state.accounts[alias];
+    const marker = alias === activeAlias ? "*" : " ";
+    const remaining =
+      typeof account.remainingTokens === "number" ? String(account.remainingTokens) : "unknown";
+    const resetAt = account.resetAt || "unknown";
+    console.log(
+      `${marker} ${alias}  status=${account.status}  remaining=${remaining}  reset=${resetAt}  account=${account.accountIdShort}`
+    );
+  }
+}
+
+function showStatus() {
+  const state = readState();
+  const activeAlias = syncActiveAlias(state);
+  const auth = currentAuthExists() ? readCurrentAuth() : null;
+  console.log(`codex_auth_present=${Boolean(auth)}`);
+  console.log(`active_alias=${activeAlias || "unmanaged"}`);
+  if (auth) {
+    console.log(`auth_mode=${auth.auth_mode || "unknown"}`);
+    console.log(`current_account=${safeAccountId(auth)}`);
+  }
+  console.log(`saved_accounts=${state.accountOrder.filter((alias) => state.accounts[alias]).length}`);
+}
+
+function writeAuthFromAlias(alias, reason = "manual-switch") {
+  const state = readState();
+  const account = getAccount(state, alias);
+  if (!fs.existsSync(account.snapshotPath)) {
+    fatal(`Missing snapshot for alias ${alias}: ${account.snapshotPath}`);
+  }
+  copyFileStrict(account.snapshotPath, AUTH_PATH);
+  state.activeAlias = alias;
+  account.lastUsedAt = nowIso();
+  account.lastSeenAt = nowIso();
+  account.lastSwitchReason = reason;
+  saveState(state);
+  console.log(`Switched active Codex auth to '${alias}'`);
+}
+
+function chooseNextAlias(state, fromAlias) {
+  const aliases = state.accountOrder.filter((alias) => state.accounts[alias]);
+  if (aliases.length === 0) {
+    return null;
+  }
+  const startIndex = Math.max(aliases.indexOf(fromAlias), -1);
+  const ordered = aliases
+    .slice(startIndex + 1)
+    .concat(aliases.slice(0, startIndex + 1));
+
+  for (const alias of ordered) {
+    const account = state.accounts[alias];
+    if (!account) {
+      continue;
+    }
+    if (alias === fromAlias) {
+      continue;
+    }
+    if (account.status === "exhausted" && !isResetDue(account.resetAt)) {
+      continue;
+    }
+    return alias;
+  }
+  return null;
+}
+
+function isResetDue(resetAt) {
+  if (!resetAt) {
+    return false;
+  }
+  const resetTs = Date.parse(resetAt);
+  return Number.isFinite(resetTs) && resetTs <= Date.now();
+}
+
+function rotateToNext(reason = "rotate") {
+  const state = readState();
+  const activeAlias = syncActiveAlias(state);
+  const nextAlias = chooseNextAlias(state, activeAlias);
+  if (!nextAlias) {
+    fatal("No fallback account is available.");
+  }
+  writeAuthFromAlias(nextAlias, reason);
+}
+
+function removeAlias(alias) {
+  const state = readState();
+  const account = getAccount(state, alias);
+  if (fs.existsSync(account.snapshotPath)) {
+    fs.unlinkSync(account.snapshotPath);
+  }
+  delete state.accounts[alias];
+  state.accountOrder = state.accountOrder.filter((item) => item !== alias);
+  if (state.activeAlias === alias) {
+    state.activeAlias = detectActiveAlias(state);
+  }
+  saveState(state);
+  console.log(`Removed account '${alias}'`);
+}
+
+function updateAlias(alias, patch) {
+  const state = readState();
+  const account = getAccount(state, alias);
+  Object.assign(account, patch, { lastSeenAt: nowIso() });
+  saveState(state);
+  console.log(`Updated account '${alias}'`);
+}
+
+function markExhausted(alias, resetAt) {
+  const state = readState();
+  const account = getAccount(state, alias);
+  account.status = "exhausted";
+  account.lastExhaustedAt = nowIso();
+  if (resetAt) {
+    account.resetAt = resetAt;
+  }
+  saveState(state);
+  console.log(`Marked '${alias}' as exhausted`);
+}
+
+function markReady(alias) {
+  const state = readState();
+  const account = getAccount(state, alias);
+  account.status = "ready";
+  account.lastSeenAt = nowIso();
+  saveState(state);
+  console.log(`Marked '${alias}' as ready`);
+}
+
+function parseOptions(argv) {
+  const options = {};
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (!token.startsWith("--")) {
+      continue;
+    }
+    const [key, inlineValue] = token.slice(2).split("=", 2);
+    const value = inlineValue !== undefined ? inlineValue : argv[index + 1];
+    options[key] = value;
+    if (inlineValue === undefined) {
+      index += 1;
+    }
+  }
+  return options;
+}
+
+function printHelp() {
+  console.log(`ckr - Codex keyring (local, best-effort)
+
+Commands:
+  add <alias>                Save current ~/.codex/auth.json as a named account
+  list                       List stored accounts and metadata
+  status                     Show current active account
+  use <alias>                Switch ~/.codex/auth.json to a saved account
+  next                       Rotate to the next available account
+  remove <alias>             Delete a saved account snapshot
+  mark-exhausted <alias>     Mark account exhausted; optional --reset-at ISO_TIMESTAMP
+  mark-ready <alias>         Mark account ready again
+  set <alias> [options]      Update metadata: --status --remaining --reset-at --note
+  run -- <command...>        Run a command and auto-switch on quota-like failure
+  doctor                     Validate local paths and print storage locations
+
+Notes:
+  - remaining/reset are metadata only unless you update them yourself.
+  - auto-switch is best-effort and works best for new Codex sessions or codex exec.
+`);
+}
+
+function doctor() {
+  ensureStore();
+  console.log(`codex_dir=${CODEX_DIR}`);
+  console.log(`auth_path=${AUTH_PATH}`);
+  console.log(`auth_exists=${currentAuthExists()}`);
+  console.log(`store_dir=${STORE_DIR}`);
+  console.log(`state_path=${STATE_PATH}`);
+}
+
+function parseRunArgs(argv) {
+  const delimiterIndex = argv.indexOf("--");
+  if (delimiterIndex === -1 || delimiterIndex === argv.length - 1) {
+    fatal("run requires a command after --");
+  }
+  return argv.slice(delimiterIndex + 1);
+}
+
+function isQuotaFailure(bufferText) {
+  return QUOTA_PATTERNS.some((pattern) => pattern.test(bufferText));
+}
+
+function withActiveAlias(state) {
+  const activeAlias = detectActiveAlias(state);
+  state.activeAlias = activeAlias;
+  saveState(state);
+  return activeAlias;
+}
+
+async function runWithFailover(commandArgs) {
+  const maxAttempts = 10;
+  let attempt = 0;
+
+  while (attempt < maxAttempts) {
+    attempt += 1;
+    const state = readState();
+    const activeAlias = withActiveAlias(state);
+    if (!activeAlias) {
+      fatal("Current auth is not managed by ckr. Run 'ckr add <alias>' for the current account first.");
+    }
+
+    console.error(`Running with account '${activeAlias}' (attempt ${attempt})`);
+    const result = await spawnAndMirror(commandArgs);
+    if (result.exitCode === 0 && !result.quotaDetected) {
+      return;
+    }
+
+    if (!result.quotaDetected) {
+      process.exit(result.exitCode || 1);
+    }
+
+    const latestState = readState();
+    const account = getAccount(latestState, activeAlias);
+    account.status = "exhausted";
+    account.lastExhaustedAt = nowIso();
+    saveState(latestState);
+    const nextAlias = chooseNextAlias(latestState, activeAlias);
+    if (!nextAlias) {
+      fatal(`Quota hit on '${activeAlias}', and no fallback account is available.`);
+    }
+
+    writeAuthFromAlias(nextAlias, "quota-failover");
+  }
+
+  fatal("Stopped after too many retry attempts.");
+}
+
+function spawnAndMirror(commandArgs) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(commandArgs[0], commandArgs.slice(1), {
+      cwd: process.cwd(),
+      env: process.env,
+      stdio: ["inherit", "pipe", "pipe"],
+    });
+
+    let combined = "";
+
+    child.stdout.on("data", (chunk) => {
+      const text = chunk.toString();
+      combined += text;
+      process.stdout.write(chunk);
+    });
+
+    child.stderr.on("data", (chunk) => {
+      const text = chunk.toString();
+      combined += text;
+      process.stderr.write(chunk);
+    });
+
+    child.on("error", reject);
+    child.on("close", (exitCode) => {
+      resolve({
+        exitCode,
+        quotaDetected: isQuotaFailure(combined),
+      });
+    });
+  });
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  const command = argv[0];
+
+  if (!command || command === "help" || command === "--help" || command === "-h") {
+    printHelp();
+    return;
+  }
+
+  switch (command) {
+    case "add":
+      addCurrentAccount(argv[1], parseOptions(argv.slice(2)).from || AUTH_PATH);
+      return;
+    case "list":
+      listAccounts();
+      return;
+    case "status":
+      showStatus();
+      return;
+    case "use":
+      writeAuthFromAlias(argv[1]);
+      return;
+    case "next":
+      rotateToNext();
+      return;
+    case "remove":
+      removeAlias(argv[1]);
+      return;
+    case "mark-exhausted": {
+      const options = parseOptions(argv.slice(2));
+      markExhausted(argv[1], options["reset-at"]);
+      return;
+    }
+    case "mark-ready":
+      markReady(argv[1]);
+      return;
+    case "set": {
+      const alias = argv[1];
+      const options = parseOptions(argv.slice(2));
+      const patch = {};
+      if (options.status) {
+        patch.status = options.status;
+      }
+      if (options.remaining !== undefined) {
+        const remaining = Number(options.remaining);
+        patch.remainingTokens = Number.isFinite(remaining) ? remaining : null;
+      }
+      if (options["reset-at"] !== undefined) {
+        patch.resetAt = options["reset-at"] || null;
+      }
+      if (options.note !== undefined) {
+        patch.note = options.note || null;
+      }
+      updateAlias(alias, patch);
+      return;
+    }
+    case "run": {
+      const commandArgs = parseRunArgs(argv);
+      await runWithFailover(commandArgs);
+      return;
+    }
+    case "doctor":
+      doctor();
+      return;
+    default:
+      fatal(`Unknown command: ${command}`);
+  }
+}
+
+main().catch((error) => {
+  fatal(error instanceof Error ? error.message : String(error));
+});
