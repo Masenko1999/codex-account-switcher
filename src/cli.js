@@ -506,12 +506,14 @@ Commands:
   mark-exhausted <alias>     Mark account exhausted; optional --reset-at ISO_TIMESTAMP
   mark-ready <alias>         Mark account ready again
   set <alias> [options]      Update metadata: --status --remaining --reset-at --note
+  exec <args...>             Run 'codex exec ...' with auto-failover
   run -- <command...>        Run a command and auto-switch on quota-like failure
   doctor                     Validate local paths and print storage locations
 
 Notes:
   - remaining/reset are metadata only unless you update them yourself.
-  - auto-switch is best-effort and works best for new Codex sessions or codex exec.
+  - auto-switch is best-effort and works for commands launched through 'ckr run' or 'ckr exec'.
+  - an already-running Codex desktop/TUI session will not switch accounts by itself.
 `);
 }
 
@@ -531,6 +533,14 @@ function parseRunArgs(argv) {
     fatal("run requires a command after --");
   }
   return argv.slice(delimiterIndex + 1);
+}
+
+function parseExecArgs(argv) {
+  const execArgs = argv.slice(1);
+  if (execArgs.length === 0) {
+    fatal("exec requires arguments to forward to 'codex exec'");
+  }
+  return [CODEX_BIN, "exec", ...execArgs];
 }
 
 function isQuotaFailure(bufferText) {
@@ -698,6 +708,11 @@ async function main() {
         patch.note = options.note || null;
       }
       updateAlias(alias, patch);
+      return;
+    }
+    case "exec": {
+      const commandArgs = parseExecArgs(argv);
+      await runWithFailover(commandArgs);
       return;
     }
     case "run": {

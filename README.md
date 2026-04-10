@@ -31,6 +31,7 @@ ckr use personal
 ckr next
 ckr mark-exhausted work --reset-at 2026-04-10T00:00:00+07:00
 ckr set personal --status ready --remaining 120000 --reset-at 2026-04-10T00:00:00+07:00
+ckr exec "hello"
 ckr run -- codex exec "hello"
 ```
 
@@ -42,13 +43,15 @@ ckr run -- codex exec "hello"
 - `ckr add <alias> --login --device-auth`: tuong tu tren, nhung buoc login dung `codex login --device-auth`.
 - `ckr use <alias>`: copy snapshot da luu ve lai `~/.codex/auth.json`.
 - `ckr next`: chuyen sang account tiep theo khong bi danh dau `exhausted`.
+- `ckr exec <args...>`: chay `codex exec <args...>` qua wrapper auto-failover.
 - `ckr run -- <command...>`: chay command va neu gap loi giong quota/rate-limit thi danh dau account hien tai la `exhausted`, sau do switch sang account tiep theo va chay lai.
 
 ## Gioi han
 
 - Tool nay khong dung API chinh thuc de doc so token con lai hoac thoi diem reset.
 - `remainingTokens` va `resetAt` hien tai la metadata do ban tu cap nhat, hoac do tool danh dau best-effort khi gap loi quota.
-- Auto-switch on dinh nhat cho session moi hoac `codex exec`. Mot session Codex desktop dang chay co the can mo lai de nhan auth moi.
+- Auto-switch chi xay ra khi ban chay qua `ckr run -- ...` hoac `ckr exec ...`.
+- Mot session Codex desktop/TUI da dang chay se khong tu doi account giua chung. Neu primary het quota trong session do, ban can mo lai session qua account moi.
 - Tool luu snapshot auth dang plain JSON trong may local. Quyen file la `0600`, nhung khong ma hoa.
 
 ## Du lieu local
