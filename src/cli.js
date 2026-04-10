@@ -105,8 +105,12 @@ function extractEmailFromAuth(authObject) {
   return payload?.email || null;
 }
 
+function extractAccountId(authObject) {
+  return authObject?.tokens?.account_id || authObject?.account_id || null;
+}
+
 function safeAccountId(authObject) {
-  const accountId = authObject?.tokens?.account_id || authObject?.account_id || "";
+  const accountId = extractAccountId(authObject) || "";
   if (!accountId) {
     return "unknown";
   }
@@ -131,22 +135,79 @@ function getAccount(state, alias) {
   return account;
 }
 
-function detectActiveAlias(state) {
-  if (!currentAuthExists()) {
-    return null;
+function identifyAliasForAuth(state, authObject) {
+  const currentHash = authHash(authObject);
+  const currentAccountId = extractAccountId(authObject);
+  const currentEmail = extractEmailFromAuth(authObject);
+
+  if (currentAccountId) {
+    for (const alias of Object.keys(state.accounts)) {
+      const account = state.accounts[alias];
+      if (account.accountId && account.accountId === currentAccountId) {
+        return alias;
+      }
+    }
   }
-  const currentHash = authHash(readCurrentAuth());
+
+  if (currentEmail) {
+    for (const alias of Object.keys(state.accounts)) {
+      const account = state.accounts[alias];
+      if (account.email && account.email === currentEmail) {
+        return alias;
+      }
+    }
+  }
+
   for (const alias of Object.keys(state.accounts)) {
     const account = state.accounts[alias];
     if (account.authHash === currentHash) {
       return alias;
     }
   }
+
   return null;
 }
 
+function refreshAccountSnapshot(state, alias, authObject, options = {}) {
+  const account = getAccount(state, alias);
+  account.authMode = authObject.auth_mode || account.authMode || "unknown";
+  account.email = extractEmailFromAuth(authObject) || account.email || null;
+  account.accountId = extractAccountId(authObject) || account.accountId || null;
+  account.accountIdShort = safeAccountId(authObject);
+  account.authHash = authHash(authObject);
+  account.lastSeenAt = nowIso();
+
+  if (options.updateLastUsed) {
+    account.lastUsedAt = nowIso();
+  }
+
+  if (account.snapshotPath) {
+    copyFileStrict(AUTH_PATH, account.snapshotPath);
+  }
+}
+
+function detectActiveAlias(state, authObject = null) {
+  if (!currentAuthExists()) {
+    return null;
+  }
+  return identifyAliasForAuth(state, authObject || readCurrentAuth());
+}
+
 function syncActiveAlias(state) {
-  state.activeAlias = detectActiveAlias(state);
+  if (!currentAuthExists()) {
+    state.activeAlias = null;
+    saveState(state);
+    return state.activeAlias;
+  }
+
+  const currentAuth = readCurrentAuth();
+  const activeAlias = identifyAliasForAuth(state, currentAuth);
+  state.activeAlias = activeAlias;
+
+  if (activeAlias) {
+    refreshAccountSnapshot(state, activeAlias, currentAuth);
+  }
+
   saveState(state);
   return state.activeAlias;
 }
@@ -174,7 +235,7 @@ function addCurrentAccount(alias, sourcePath = AUTH_PATH) {
     alias,
     authMode: authObject.auth_mode || "unknown",
     email: extractEmailFromAuth(authObject),
-    accountId: authObject?.tokens?.account_id || null,
+    accountId: extractAccountId(authObject),
     accountIdShort: safeAccountId(authObject),
     authHash: authHash(authObject),
     snapshotPath,
@@ -188,7 +249,7 @@ function addCurrentAccount(alias, sourcePath = AUTH_PATH) {
     lastExhaustedAt: null,
   };
   state.accountOrder.push(alias);
-  state.activeAlias = detectActiveAlias(state);
+  state.activeAlias = detectActiveAlias(state, authObject);
   saveState(state);
   console.log(`Added account '${alias}' (${state.accounts[alias].accountIdShort})`);
 }
@@ -319,9 +380,8 @@ function writeAuthFromAlias(alias, reason = "manual-switch") {
   }
   copyFileStrict(account.snapshotPath, AUTH_PATH);
   state.activeAlias = alias;
-  account.lastUsedAt = nowIso();
-  account.lastSeenAt = nowIso();
   account.lastSwitchReason = reason;
+  refreshAccountSnapshot(state, alias, readCurrentAuth(), { updateLastUsed: true });
   saveState(state);
   console.log(`Switched active Codex auth to '${alias}'`);
 }
