@@ -53,6 +53,10 @@ function writeJson(filePath, value, mode = 0o600) {
   });
 }
 
+function writeAuthObject(authObject) {
+  writeJson(AUTH_PATH, authObject, 0o600);
+}
+
 function readState() {
   ensureStore();
   return readJson(STATE_PATH);
@@ -266,20 +270,51 @@ async function addAccountWithLogin(alias, options = {}) {
     fatal(`Alias already exists: ${alias}`);
   }
 
-  await runInteractiveCommand(CODEX_BIN, ["logout"], {
-    allowFailure: true,
-    stepLabel: "Logging out of current Codex account",
-  });
-
-  const loginArgs = ["login"];
-  if (options["device-auth"]) {
-    loginArgs.push("--device-auth");
-  }
-  await runInteractiveCommand(CODEX_BIN, loginArgs, {
-    stepLabel: "Starting Codex login flow",
-  });
+  await performCodexLogin(options, "Starting Codex login flow");
 
   addCurrentAccount(alias, sourcePath);
+}
+
+async function loginAlias(alias, options = {}) {
+  ensureAlias(alias);
+  const state = readState();
+  getAccount(state, alias);
+  const previousAuth = currentAuthExists() ? readCurrentAuth() : null;
+  const previousActiveAlias = syncActiveAlias(state);
+
+  await performCodexLogin(options, `Starting login flow for alias '${alias}'`);
+
+  const currentAuth = readCurrentAuth();
+  const identifiedAlias = identifyAliasForAuth(state, currentAuth);
+  if (identifiedAlias !== alias) {
+    if (previousAuth) {
+      writeAuthObject(previousAuth);
+      state.activeAlias = previousActiveAlias;
+      saveState(state);
+    }
+    const matched = identifiedAlias || "unmanaged";
+    fatal(
+      `Logged-in account does not match alias '${alias}'. It matches '${matched}' instead.`
+    );
+  }
+
+  refreshAccountSnapshot(state, alias, currentAuth, { updateLastUsed: true });
+  state.activeAlias = alias;
+  saveState(state);
+  console.log(`Logged in and refreshed alias '${alias}'`);
+}
+
+async function useAlias(alias, options = {}) {
+  ensureAlias(alias);
+  const state = readState();
+  const activeAlias = syncActiveAlias(state);
+
+  if (activeAlias === alias) {
+    console.log(`Alias '${alias}' is already logged in.`);
+    return;
+  }
+
+  await loginAlias(alias, options);
 }
 
 function listAccounts() {
@@ -304,6 +339,7 @@ function listAccounts() {
     }
     return {
       Active: alias === activeAlias ? "*" : "",
+      "Logged In": alias === activeAlias ? "yes" : "no",
       Alias: alias,
       Email: account.email || "unknown",
       Status: account.status || "unknown",
@@ -318,6 +354,7 @@ function listAccounts() {
 
   printTable(rows, [
     "Active",
+    "Logged In",
     "Alias",
     "Email",
     "Status",
@@ -330,6 +367,51 @@ function listAccounts() {
 
   if (stateChanged) {
     saveState(state);
+  }
+}
+
+async function logoutAlias(alias = null) {
+  const state = readState();
+  const activeAlias = syncActiveAlias(state);
+  const targetAlias = alias || activeAlias;
+
+  if (!targetAlias) {
+    fatal("No active alias is logged in.");
+  }
+
+  getAccount(state, targetAlias);
+
+  if (activeAlias !== targetAlias) {
+    writeAuthFromAlias(targetAlias, "logout-target");
+  }
+
+  await runInteractiveCommand(CODEX_BIN, ["logout"], {
+    allowFailure: false,
+    stepLabel: `Logging out alias '${targetAlias}'`,
+  });
+
+  state.activeAlias = null;
+  saveState(state);
+  console.log(`Logged out alias '${targetAlias}'`);
+}
+
+async function performCodexLogin(options = {}, stepLabel = "Starting Codex login flow") {
+  await runInteractiveCommand(CODEX_BIN, ["logout"], {
+    allowFailure: true,
+    stepLabel: "Logging out of current Codex account",
+  });
+
+  const loginArgs = ["login"];
+  if (options["device-auth"]) {
+    loginArgs.push("--device-auth");
+  }
+
+  await runInteractiveCommand(CODEX_BIN, loginArgs, {
+    stepLabel,
+  });
+
+  if (!currentAuthExists()) {
+    fatal("Login finished but no auth file was found.");
   }
 }
 
@@ -500,7 +582,9 @@ Commands:
   add <alias>                Save current ~/.codex/auth.json as a named account
   list                       List stored accounts and metadata
   status                     Show current active account
-  use <alias>                Switch ~/.codex/auth.json to a saved account
+  login <alias>              Login again for an existing alias and refresh its snapshot
+  use <alias>                Ensure the alias is logged in; triggers login if needed
+  logout [alias]             Logout the active alias, or switch to and logout a specific alias
   next                       Rotate to the next available account
   remove <alias>             Delete a saved account snapshot
   mark-exhausted <alias>     Mark account exhausted; optional --reset-at ISO_TIMESTAMP
@@ -673,8 +757,14 @@ async function main() {
     case "status":
       showStatus();
       return;
+    case "login":
+      await loginAlias(argv[1], parseOptions(argv.slice(2)));
+      return;
     case "use":
-      writeAuthFromAlias(argv[1]);
+      await useAlias(argv[1], parseOptions(argv.slice(2)));
+      return;
+    case "logout":
+      await logoutAlias(argv[1] || null);
       return;
     case "next":
       rotateToNext();
